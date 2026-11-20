@@ -84,6 +84,25 @@ Comments and whitespace are removed throughout. Strings and character literals
 are never split or altered, so a long string sets a floor on how narrow the
 square can get.
 
+## Examples
+
+```bash
+# smallest compilable output, square, Serial logging stripped
+python3 minsquare.py sketch.ino -o sketch.min.cpp
+
+# keep Serial logging
+python3 minsquare.py sketch.ino -serial -o sketch.min.cpp
+
+# shape the code to the white pixels of an image
+python3 minsquare.py sketch.ino --png circle.png -o sketch.shaped.cpp
+
+# multi-file project: only use reversible #define aliases, never rename
+python3 minsquare.py part.cpp --no-rename -o part.min.cpp
+
+# print to the terminal instead of a file
+python3 minsquare.py sketch.ino
+```
+
 ## Safety and limits
 
 - Direct renaming assumes a **single self-contained translation unit**. On
