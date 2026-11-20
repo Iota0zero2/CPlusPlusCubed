@@ -29,6 +29,24 @@ Writes to stdout if you omit `-o`.
 | `--aspect R` | monospace cell height/width for a *visual* square (default 2.0) |
 | `--char-square` | make character rows == columns (aspect 1.0) |
 | `--width W` | force a fixed column width instead of the square calc |
+| `--png FILE` | shape the code to a black/white image's white pixels |
+| `--threshold N` | luminance cutoff for white vs black, 0–255 (default 128) |
+
+## Shaping to an image
+
+Pass a black-and-white PNG and the code is poured into its **white** pixels,
+black pixels become empty space:
+
+```
+python3 minsquare.py sketch.ino --png circle.png -o out.cpp
+```
+
+The image can be any size and any colours (it's reduced to luminance and
+thresholded). The tool automatically scales the shape so the white area holds
+the code exactly — all of it fits and little is left empty. Tokens are never
+split, so the result still compiles. Any `#define` lines sit above the shape.
+
+With no `--png`, the layout is a square, as described above.
 
 Monospace characters are about twice as tall as they are wide, so the default
 `--aspect 2.0` produces a block that *looks* square on screen. Use

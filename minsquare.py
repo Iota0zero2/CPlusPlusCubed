@@ -456,6 +456,205 @@ def oneline_len(toks):
     return total
 
 
+def _paeth(a, b, c):
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    return b if pb <= pc else c
+
+
+def load_png_mask(path, thresh=128):
+    """Read a PNG into a 2-D bool mask (True = white = where code goes).
+
+    Pure stdlib. Supports non-interlaced PNGs, bit depths 1/2/4/8/16, and
+    colour types grayscale, RGB, palette, and their alpha variants. Any
+    colour is reduced to luminance and thresholded, so a plain black/white
+    image works directly.
+    """
+    import struct
+    import zlib
+
+    data = open(path, "rb").read()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG file")
+    pos = 8
+    width = height = bitd = ctype = interlace = 0
+    idat = bytearray()
+    plte = trns = None
+    while pos + 8 <= len(data):
+        ln = struct.unpack(">I", data[pos:pos + 4])[0]
+        typ = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + ln]
+        pos += 12 + ln
+        if typ == b"IHDR":
+            (width, height, bitd, ctype, _comp, _filt,
+             interlace) = struct.unpack(">IIBBBBB", chunk)
+        elif typ == b"PLTE":
+            plte = chunk
+        elif typ == b"tRNS":
+            trns = chunk
+        elif typ == b"IDAT":
+            idat += chunk
+        elif typ == b"IEND":
+            break
+    if interlace != 0:
+        raise ValueError("interlaced PNGs are not supported")
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
+    raw = zlib.decompress(bytes(idat))
+    stride = (width * channels * bitd + 7) // 8
+    bpp = max(1, (channels * bitd + 7) // 8)
+    rows = []
+    prev = bytearray(stride)
+    i = 0
+    for _y in range(height):
+        f = raw[i]
+        i += 1
+        line = bytearray(raw[i:i + stride])
+        i += stride
+        if f == 1:
+            for x in range(bpp, stride):
+                line[x] = (line[x] + line[x - bpp]) & 255
+        elif f == 2:
+            for x in range(stride):
+                line[x] = (line[x] + prev[x]) & 255
+        elif f == 3:
+            for x in range(stride):
+                a = line[x - bpp] if x >= bpp else 0
+                line[x] = (line[x] + ((a + prev[x]) >> 1)) & 255
+        elif f == 4:
+            for x in range(stride):
+                a = line[x - bpp] if x >= bpp else 0
+                c = prev[x - bpp] if x >= bpp else 0
+                line[x] = (line[x] + _paeth(a, prev[x], c)) & 255
+        prev = line
+        rows.append(bytes(line))
+
+    maxval = (1 << bitd) - 1
+
+    def channels_at(line, x):
+        if bitd == 8:
+            off = x * channels
+            return tuple(line[off:off + channels])
+        if bitd == 16:
+            off = x * channels * 2
+            return tuple(line[off + 2 * k] for k in range(channels))
+        per = 8 // bitd                       # sub-byte (1/2/4), 1 channel
+        byte = line[x // per]
+        shift = (per - 1 - (x % per)) * bitd
+        return ((byte >> shift) & maxval,)
+
+    mask = []
+    for line in rows:
+        mrow = []
+        for x in range(width):
+            px = channels_at(line, x)
+            if ctype == 3:                     # palette
+                idx = px[0]
+                r, g, b = plte[idx * 3], plte[idx * 3 + 1], plte[idx * 3 + 2]
+                a = 255
+                if trns and idx < len(trns):
+                    a = trns[idx]
+                lum = 0.299 * r + 0.587 * g + 0.114 * b
+            elif ctype in (0, 4):              # gray (+alpha)
+                v = px[0] * 255 // maxval if bitd < 8 else px[0]
+                a = px[1] if ctype == 4 else 255
+                lum = v
+            else:                              # RGB(A)
+                r, g, b = px[0], px[1], px[2]
+                a = px[3] if ctype == 6 else 255
+                lum = 0.299 * r + 0.587 * g + 0.114 * b
+            mrow.append(lum >= thresh and a >= 128)
+        mask.append(mrow)
+    return mask
+
+
+def resize_mask(mask, rows, aspect):
+    """Nearest-neighbour resize to `rows` tall, width set by aspect so the
+    shape looks right in a monospace grid (cells ~`aspect`x tall)."""
+    h0 = len(mask)
+    w0 = len(mask[0]) if h0 else 1
+    cols = max(1, round(rows * (w0 / h0) * aspect))
+    out = []
+    for y in range(rows):
+        sy = min(h0 - 1, y * h0 // rows)
+        src = mask[sy]
+        out.append([src[min(w0 - 1, x * w0 // cols)] for x in range(cols)])
+    return out
+
+
+def shape_place(tokens, mask):
+    """Pour tokens into the white runs of `mask`, row by row.
+
+    Returns (all_placed, lines). Black pixels and run padding become spaces;
+    tokens are never split, so a token only lands inside one white run.
+    """
+    ti, n = 0, len(tokens)
+    lines = []
+    for row in mask:
+        w = len(row)
+        buf = [" "] * w
+        x = 0
+        while x < w:
+            if not row[x]:
+                x += 1
+                continue
+            e = x
+            while e < w and row[e]:
+                e += 1
+            pos = x
+            prev = None
+            while ti < n:
+                tv = tokens[ti].v
+                sep = 1 if (prev is not None and needsep(prev, tv)) else 0
+                if pos + sep + len(tv) <= e:
+                    pos += sep
+                    for ch in tv:
+                        buf[pos] = ch
+                        pos += 1
+                    prev = tv
+                    ti += 1
+                else:
+                    break
+            x = e
+        lines.append("".join(buf).rstrip())
+    return ti == n, lines
+
+
+def fit_mask(tokens, mask0, aspect):
+    """Find the smallest scale of mask0 that fits every token; render it."""
+    import math
+    white0 = sum(sum(1 for c in r if c) for r in mask0)
+    h0 = len(mask0)
+    w0 = len(mask0[0]) if h0 else 1
+    total = sum(len(t.v) for t in tokens) + len(tokens)   # chars + rough seps
+    phi = white0 / (h0 * w0) if h0 and w0 else 0
+    if phi <= 0:
+        raise ValueError("the image has no white pixels for code to fill")
+    est = max(2, int(math.sqrt(total / (phi * (w0 / h0) * aspect))))
+
+    def ok(R):
+        placed, _ = shape_place(tokens, resize_mask(mask0, R, aspect))
+        return placed
+
+    hi = est
+    cap = est * 16 + 200
+    while hi < cap and not ok(hi):
+        hi *= 2
+    if not ok(hi):
+        raise ValueError("the shape is too thin to hold the code's longest "
+                         "tokens; try a rounder/larger image")
+    lo = 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if ok(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    _, lines = shape_place(tokens, resize_mask(mask0, hi, aspect))
+    return lines
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Minify C/C++ and square it.")
     ap.add_argument("input")
@@ -472,6 +671,10 @@ def main(argv=None):
     ap.add_argument("--aspect", type=float, default=2.0)
     ap.add_argument("--char-square", action="store_true")
     ap.add_argument("--width", type=int)
+    ap.add_argument("--png", help="black/white image; code fills the white "
+                                  "pixels, scaled so it fits exactly")
+    ap.add_argument("--threshold", type=int, default=128,
+                    help="luminance cutoff for white vs black (0-255)")
     ap.add_argument("--keep-comments", action="store_true")
     args = ap.parse_args(argv)
 
@@ -505,22 +708,31 @@ def main(argv=None):
                                         args.macro_min_len,
                                         exclude=dotted_names(toks))
 
-    # prepend generated macros as their own directive tokens
-    head = [Tok("dir", d) for d in new_defines]
-    toks = head + toks
+    aspect = 1.0 if args.char_square else args.aspect
 
-    # choose a width for a (visual) square
-    if args.width:
-        width = args.width
+    if args.png:
+        # shape the code to the image's white pixels; directives go above it
+        mask0 = load_png_mask(args.png, args.threshold)
+        dirs = [Tok("dir", d) for d in new_defines] + \
+               [t for t in toks if t.k == "dir"]
+        code = [t for t in toks if t.k != "dir"]
+        body = fit_mask(code, mask0, aspect)
+        lines = [d.v for d in dirs] + body
+        out = "\n".join(lines) + "\n"
     else:
-        aspect = 1.0 if args.char_square else args.aspect
-        body = oneline_len(toks)
-        width = max(1, round(math.sqrt(max(1, body) * aspect)))
-    longest = max((len(t.v) for t in toks if t.k != "dir"), default=1)
-    width = max(width, longest)
-
-    lines = layout(toks, width)
-    out = "\n".join(lines) + "\n"
+        # prepend generated macros as their own directive tokens
+        head = [Tok("dir", d) for d in new_defines]
+        toks = head + toks
+        # choose a width for a (visual) square
+        if args.width:
+            width = args.width
+        else:
+            body = oneline_len(toks)
+            width = max(1, round(math.sqrt(max(1, body) * aspect)))
+        longest = max((len(t.v) for t in toks if t.k != "dir"), default=1)
+        width = max(width, longest)
+        lines = layout(toks, width)
+        out = "\n".join(lines) + "\n"
 
     if args.output:
         open(args.output, "w", encoding="utf-8").write(out)
