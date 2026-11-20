@@ -322,24 +322,35 @@ def detect_renameable(toks):
 
 
 def rename_idents(toks, names):
-    """Rename the given identifiers to the shortest fresh aliases."""
+    """Rename the given identifiers to the shortest fresh aliases.
+
+    Only identifiers longer than one character can shrink. Every name that
+    ends up keeping its spelling (including short ones) is reserved so no
+    alias ever collides with it. Ordering is deterministic.
+    """
+    names = {n for n in names if len(n) > 1}
     if not names:
         return {}
-    existing = {t.v for t in toks if t.k == "id"} - names
-    # most frequent first so the shortest names go to the hottest identifiers
     freq = {}
     for t in toks:
         if t.k == "id" and t.v in names:
             freq[t.v] = freq.get(t.v, 0) + 1
-    order = sorted(names, key=lambda x: freq.get(x, 0), reverse=True)
-    pool = pick_aliases(len(order), existing)
+    # hottest first; ties broken by name so runs are reproducible
+    order = sorted(names, key=lambda x: (-freq.get(x, 0), x))
+    # reserved = every spelling that will remain in the code
+    reserved = ({t.v for t in toks if t.k == "id"} - names) | set(KEYWORDS)
+    gen = alias_candidates()
+    nxt = next(gen)
     mapping = {}
     for name in order:
-        alias = next(pool)
-        # only rename if it actually shortens
-        if len(alias) < len(name):
-            mapping[name] = alias
-            existing.add(alias)
+        while nxt in reserved:
+            nxt = next(gen)
+        if len(nxt) < len(name):          # use this alias
+            mapping[name] = nxt
+            reserved.add(nxt)
+            nxt = next(gen)
+        else:                             # can't shorten; keep original name
+            reserved.add(name)
     for t in toks:
         if t.k == "id" and t.v in mapping:
             t.v = mapping[t.v]
@@ -356,13 +367,19 @@ def needsep(a, b):
     return (c1 + c2) in _DANGER2
 
 
+def alias_candidates():
+    """Yield short identifier names: a..z, A..Z, then aa, ab, ... ."""
+    import string
+    for a in string.ascii_letters:
+        yield a
+    for a in string.ascii_letters:
+        for b in string.ascii_lowercase:
+            yield a + b
+
+
 def pick_aliases(count, existing):
     """Yield short alias names not colliding with existing identifiers."""
-    import string
-    pool = list(string.ascii_letters)
-    two = [a + b for a in string.ascii_letters for b in
-           string.ascii_lowercase]
-    for name in pool + two:
+    for name in alias_candidates():
         if name not in existing and name not in KEYWORDS:
             yield name
 
