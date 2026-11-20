@@ -600,11 +600,14 @@ def resize_mask(mask, rows, aspect):
     return out
 
 
-def shape_place(tokens, mask):
+def shape_place(tokens, mask, density=1.0):
     """Pour tokens into the white runs of `mask`, row by row.
 
     Returns (all_placed, lines). Black pixels and run padding become spaces;
-    tokens are never split, so a token only lands inside one white run.
+    tokens are never split, so a token only lands inside one white run. With
+    `density` < 1 each run is filled only to that fraction (rounded up, but
+    always at least one token when one fits), spreading the surplus space
+    evenly across the whole shape instead of dumping it at the end.
     """
     ti, n = 0, len(tokens)
     lines = []
@@ -619,22 +622,27 @@ def shape_place(tokens, mask):
             e = x
             while e < w and row[e]:
                 e += 1
+            budget = max(1, round(density * (e - x)))
             pos = x
+            used = 0
             prev = None
             while ti < n:
                 tv = tokens[ti].v
                 sep = 1 if (prev is not None and needsep(prev, tv)) else 0
-                if pos + sep + len(tv) <= e:
+                if pos + sep + len(tv) <= e and (used == 0 or used < budget):
                     pos += sep
                     for ch in tv:
                         buf[pos] = ch
                         pos += 1
+                    used += sep + len(tv)
                     prev = tv
                     ti += 1
                 else:
                     break
             x = e
         lines.append("".join(buf).rstrip())
+    while lines and lines[-1] == "":
+        lines.pop()
     return ti == n, lines
 
 
@@ -668,7 +676,15 @@ def fit_mask(tokens, mask0, aspect):
             hi = mid
         else:
             lo = mid + 1
-    _, lines = shape_place(tokens, resize_mask(mask0, hi, aspect))
+    mask = resize_mask(mask0, hi, aspect)
+    # spread the surplus white evenly so the whole shape fills (no hollow tip)
+    white = sum(1 for r in mask for c in r if c)
+    _, dense = shape_place(tokens, mask)
+    used = sum(len(line.replace(" ", "")) for line in dense)
+    density = min(1.0, used / white) if white else 1.0
+    placed, lines = shape_place(tokens, mask, density)
+    if not placed:                 # safety: fall back to the dense fill
+        return dense
     return lines
 
 
