@@ -1,11 +1,12 @@
 # CPlusPlusCubed
 
-`minsquare.py` — minify C/C++/Arduino source and lay it out as a square block.
+`minsquare.py` — minify C/C++/Arduino source into the smallest compilable code
+it safely can, laid out as a square block.
 
-It strips comments and whitespace, auto-creates short `#define` aliases for
-long identifiers that appear many times (e.g. `digitalWrite` → `W`), and
-reflows the result so the code block is as close to a square as possible in
-your editor.
+It strips comments and whitespace, renames your own identifiers to short names,
+aliases library calls with `#define` where that saves bytes, optionally removes
+`Serial` logging, and reflows the result so the code block is as close to a
+square as possible in your editor.
 
 ## Usage
 
@@ -20,6 +21,8 @@ Writes to stdout if you omit `-o`.
 | Option | Meaning |
 |---|---|
 | `-o FILE` | write to FILE (default: stdout) |
+| `-serial`, `--serial` | **keep** `Serial.xxx(...)` statements (by default they are stripped) |
+| `--no-rename` | don't rename file-defined identifiers directly (safer for multi-file projects) |
 | `--no-macros` | don't auto-generate `#define` aliases |
 | `--macro-min-uses N` | minimum uses before aliasing an identifier (default 4) |
 | `--macro-min-len N` | minimum identifier length to alias (default 5) |
@@ -31,28 +34,49 @@ Monospace characters are about twice as tall as they are wide, so the default
 `--aspect 2.0` produces a block that *looks* square on screen. Use
 `--char-square` if you want the literal character count to be square instead.
 
-## What it does and does not do
+### Serial
 
-It only makes **behavior-preserving** changes:
+By default, whole `Serial.xxx(...)` statements (`begin`, `print`, `println`,
+…) are removed — handy for Arduino sketches where the logging is only for
+debugging. Pass `-serial` to keep them:
 
-- strips `//` and `/* */` comments
-- removes non-essential whitespace (keeps a separator only where two tokens
-  would otherwise merge)
-- aliases long, frequently-used identifiers via `#define`, but only when that
-  actually saves bytes
-- reflows into a square
+```
+python3 minsquare.py sketch.ino            # Serial stripped (smallest)
+python3 minsquare.py sketch.ino -serial    # Serial kept
+```
 
-It deliberately does **not** rename your variables, inline literals, or delete
-logging. Those require understanding the program and would change or break its
-behavior, so they are left to you.
+A `Serial` call is only removed when it stands as its own statement in a block.
+One that is the single body of an `if`/`for`/`while`, or used in a condition,
+is left alone so control flow never breaks.
 
-Strings and character literals are never split or altered, so a long string
-sets a floor on how narrow the square can get.
+## How it compresses
 
-## Scope
+In order, the tool:
 
-C-like (brace) languages only. Whitespace-significant languages such as Python
-can't be line-collapsed without breaking them, so those files are rejected.
+1. **Strips Serial** statements (unless `-serial`).
+2. **Renames identifiers defined in this file** — your variables, functions,
+   enum members — directly to short names, with no `#define` overhead. Names
+   that come from a library (`digitalWrite`, `millis`, `Serial`, …) are *not*
+   renamed, because you don't own those symbols.
+3. **`#define`-aliases** the remaining long, frequently-used library names,
+   but only when it nets a byte saving (e.g. `digitalWrite` → `W`).
+4. **Reflows** everything into a square.
+
+Comments and whitespace are removed throughout. Strings and character literals
+are never split or altered, so a long string sets a floor on how narrow the
+square can get.
+
+## Safety and limits
+
+- Direct renaming assumes a **single self-contained translation unit**. On
+  multi-file projects an identifier defined here may be referenced elsewhere,
+  so use `--no-rename` (the tool then only uses reversible `#define` aliases).
+- The rename detector is conservative: when it can't be sure an identifier is
+  defined in the file, it leaves it alone and falls back to `#define`.
+- `setup`, `loop`, and `main` are never renamed.
+- C-like (brace) languages only. Whitespace-significant languages such as
+  Python can't be line-collapsed without breaking them, so those files are
+  rejected.
 
 ## License
 

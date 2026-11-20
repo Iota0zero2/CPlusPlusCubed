@@ -49,6 +49,20 @@ KEYWORDS = {
     "using", "virtual", "void", "volatile", "while", "xor",
 }
 
+# Type tokens and declaration qualifiers, used to recognise which identifiers
+# are *defined in this file* (hence safe to rename directly).
+TYPES = {
+    "int", "char", "short", "long", "unsigned", "signed", "float", "double",
+    "bool", "void", "auto", "size_t", "ssize_t", "wchar_t", "char16_t",
+    "char32_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int8_t",
+    "int16_t", "int32_t", "int64_t", "byte", "boolean", "word", "String",
+    "long", "short",
+}
+QUALS = {"const", "static", "volatile", "register", "constexpr", "inline",
+         "extern", "unsigned", "signed", "mutable"}
+# Names that must keep their spelling for the toolchain / linker.
+PROTECT = {"setup", "loop", "main"}
+
 # Multi-char operators, longest first so the lexer prefers them.
 MULTI_OPS = sorted([
     ">>=", "<<=", "...", "->*", "<=>", "::", "->", "++", "--", "<<", ">>",
@@ -167,6 +181,171 @@ def lex(src):
     return toks
 
 
+def dotted_names(toks):
+    """Identifiers used as members (after '.' or '->'); never rename these."""
+    code = [t for t in toks if t.k != "dir"]
+    out = set()
+    for i, t in enumerate(code):
+        if t.k == "op" and t.v in (".", "->") and i + 1 < len(code) \
+                and code[i + 1].k == "id":
+            out.add(code[i + 1].v)
+    return out
+
+
+def strip_serial(toks):
+    """Remove whole `Serial.xxx(...);` statements.
+
+    Only removes a Serial call that stands as its own statement in a block
+    (preceded by ';', '{', '}', a directive, or start-of-file) so it never
+    guts the single statement controlled by an `if`/`for`/`while`. Serial used
+    anywhere else (a condition, an assignment) is left untouched.
+    """
+    out = []
+    i, n = 0, len(toks)
+    prev_ok = True            # at a statement boundary?
+    while i < n:
+        t = toks[i]
+        if (t.k == "id" and t.v == "Serial" and prev_ok
+                and i + 1 < n and toks[i + 1].k == "op"
+                and toks[i + 1].v == "."):
+            # consume up to and including the statement-ending ';'
+            depth = 0
+            j = i
+            while j < n:
+                tj = toks[j]
+                if tj.k == "op" and tj.v == "(":
+                    depth += 1
+                elif tj.k == "op" and tj.v == ")":
+                    depth -= 1
+                elif tj.k == "op" and tj.v == ";" and depth == 0:
+                    j += 1
+                    break
+                j += 1
+            i = j                       # skip the whole statement
+            continue
+        out.append(t)
+        if t.k == "dir":
+            prev_ok = True
+        elif t.k == "op" and t.v in ("{", "}", ";"):
+            prev_ok = True
+        else:
+            prev_ok = False
+        i += 1
+    return out
+
+
+def detect_renameable(toks):
+    """Return identifiers that are clearly *defined in this file*.
+
+    Conservative on purpose: a false positive (renaming a library name) would
+    break compilation, so when in doubt an identifier is left out and handled
+    by the always-safe #define path instead. Detects: enum/struct/class type
+    names and enum members, and declarators that directly follow a type
+    (variables, function names, parameters), including comma-separated ones.
+    """
+    code = [t for t in toks if t.k != "dir"]
+    n = len(code)
+
+    # user-defined type names (enum/struct/class/union Name)
+    usertypes = set()
+    for i, t in enumerate(code):
+        if t.k == "id" and t.v in ("enum", "struct", "class", "union"):
+            j = i + 1
+            if j < n and code[j].k == "id" and code[j].v not in TYPES:
+                usertypes.add(code[j].v)
+    types = TYPES | usertypes
+
+    renameable = set(usertypes)
+
+    # enum members: ids inside enum { ... }
+    i = 0
+    while i < n:
+        t = code[i]
+        if t.k == "id" and t.v == "enum":
+            j = i + 1
+            if j < n and code[j].k == "id":   # optional enum name
+                j += 1
+            if j < n and code[j].k == "op" and code[j].v == "{":
+                j += 1
+                depth = 1
+                while j < n and depth:
+                    c = code[j]
+                    if c.k == "op" and c.v == "{":
+                        depth += 1
+                    elif c.k == "op" and c.v == "}":
+                        depth -= 1
+                    elif c.k == "id" and depth == 1:
+                        renameable.add(c.v)
+                    j += 1
+            i = j
+            continue
+        i += 1
+
+    # declarators following a type, across comma-separated lists
+    in_decl = False          # inside a declaration statement?
+    expect_name = False      # next id is a declared name
+    paren = 0
+    decl_paren = 0           # paren depth where the current declaration began
+    for t in code:
+        if t.k == "op":
+            if t.v == "(":
+                paren += 1
+            elif t.v == ")":
+                paren = max(0, paren - 1)
+            elif t.v in ("{", "}", ";"):
+                in_decl = False          # a block or statement end clears it
+                expect_name = False
+            elif t.v == "," and in_decl and paren == decl_paren:
+                expect_name = True       # another declarator at the same depth
+            elif t.v in ("=", "[") and in_decl:
+                expect_name = False      # initialiser / array size
+            continue
+        if t.k != "id":
+            continue
+        if t.v in types:                 # a type opens a declaration here
+            in_decl = True
+            decl_paren = paren
+            expect_name = True
+            continue
+        if t.v in QUALS:
+            continue
+        if in_decl and expect_name and paren == decl_paren:
+            renameable.add(t.v)
+            expect_name = False
+        else:
+            expect_name = False
+    renameable -= PROTECT
+    renameable -= set(KEYWORDS)
+    renameable -= TYPES
+    renameable -= dotted_names(toks)
+    return renameable
+
+
+def rename_idents(toks, names):
+    """Rename the given identifiers to the shortest fresh aliases."""
+    if not names:
+        return {}
+    existing = {t.v for t in toks if t.k == "id"} - names
+    # most frequent first so the shortest names go to the hottest identifiers
+    freq = {}
+    for t in toks:
+        if t.k == "id" and t.v in names:
+            freq[t.v] = freq.get(t.v, 0) + 1
+    order = sorted(names, key=lambda x: freq.get(x, 0), reverse=True)
+    pool = pick_aliases(len(order), existing)
+    mapping = {}
+    for name in order:
+        alias = next(pool)
+        # only rename if it actually shortens
+        if len(alias) < len(name):
+            mapping[name] = alias
+            existing.add(alias)
+    for t in toks:
+        if t.k == "id" and t.v in mapping:
+            t.v = mapping[t.v]
+    return mapping
+
+
 def needsep(a, b):
     """True if a space is required between token texts a and b."""
     c1, c2 = a[-1], b[0]
@@ -188,14 +367,14 @@ def pick_aliases(count, existing):
             yield name
 
 
-def make_macros(toks, min_uses, min_len):
+def make_macros(toks, min_uses, min_len, exclude=frozenset()):
     """Return (new_define_texts, renamed_tokens).
 
     Aliases long, frequently-used identifiers via object-like #defines, but
     only when it nets a byte saving. Identifiers mentioned in existing
-    directives are left alone for safety.
+    directives, or in `exclude` (e.g. member names), are left alone.
     """
-    in_dir = set()
+    in_dir = set(exclude)
     for t in toks:
         if t.k == "dir":
             in_dir.update(re.findall(r"[A-Za-z_]\w*", t.v))
@@ -282,6 +461,12 @@ def main(argv=None):
     ap.add_argument("input")
     ap.add_argument("-o", "--output")
     ap.add_argument("--no-macros", action="store_true")
+    ap.add_argument("--no-rename", action="store_true",
+                    help="don't rename file-defined identifiers directly "
+                         "(safer for multi-file projects)")
+    ap.add_argument("-serial", "--serial", dest="serial", action="store_true",
+                    help="keep Serial.xxx(...) statements; by default they "
+                         "are stripped out")
     ap.add_argument("--macro-min-uses", type=int, default=4)
     ap.add_argument("--macro-min-len", type=int, default=5)
     ap.add_argument("--aspect", type=float, default=2.0)
@@ -304,10 +489,21 @@ def main(argv=None):
     if not toks:
         sys.exit("No code found.")
 
+    # 0) drop Serial.xxx(...) statements unless the user asked to keep them
+    if not args.serial:
+        toks = strip_serial(toks)
+
+    # 1) directly rename identifiers defined in this file (no #define cost)
+    if not args.no_rename:
+        rename_idents(toks, detect_renameable(toks))
+
+    # 2) #define-alias the remaining long, frequently-used names (library
+    #    symbols we can't rename). Member names are never aliased.
     new_defines = []
     if not args.no_macros:
         new_defines, toks = make_macros(toks, args.macro_min_uses,
-                                        args.macro_min_len)
+                                        args.macro_min_len,
+                                        exclude=dotted_names(toks))
 
     # prepend generated macros as their own directive tokens
     head = [Tok("dir", d) for d in new_defines]
